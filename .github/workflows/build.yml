@@ -114,12 +114,49 @@ jobs:
         echo "Published Version: $VERSION"
 
     - name: Wait for SnapStart Snapshot
-      run: |
-        aws lambda wait published-version-active \
-          --function-name simple-lambda-snapstart \
-          --qualifier ${{ steps.publish_version.outputs.version }} \
-          --region us-east-1
-        echo "SnapStart snapshot ready!"
+  run: |
+    VERSION=${{ steps.publish_version.outputs.version }}
+    REGION="us-east-1"
+    FUNCTION_NAME="simple-lambda-snapstart"
+    MAX_ATTEMPTS=20
+    ATTEMPT=0
+
+    echo "Waiting for SnapStart snapshot for version $VERSION..."
+
+    while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+      STATUS=$(aws lambda get-function \
+        --function-name $FUNCTION_NAME \
+        --qualifier $VERSION \
+        --region $REGION \
+        --query 'Configuration.SnapStartResponse.OptimizationStatus' \
+        --output text 2>/dev/null || echo "UNKNOWN")
+
+      STATE=$(aws lambda get-function \
+        --function-name $FUNCTION_NAME \
+        --qualifier $VERSION \
+        --region $REGION \
+        --query 'Configuration.State' \
+        --output text 2>/dev/null || echo "UNKNOWN")
+
+      echo "Attempt $((ATTEMPT+1))/$MAX_ATTEMPTS - State: $STATE - SnapStart: $STATUS"
+
+      if [ "$STATE" == "Active" ] && [ "$STATUS" == "On" ]; then
+        echo "SnapStart snapshot is ready!"
+        break
+      fi
+
+      if [ "$STATE" == "Failed" ]; then
+        echo "Lambda version failed!"
+        exit 1
+      fi
+
+      ATTEMPT=$((ATTEMPT+1))
+      sleep 30
+    done
+
+    if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+      echo "Timeout waiting for SnapStart. Proceeding anyway..."
+    fi
 
     # ─────────────────────────────────────────
     # STEP 4 - CREATE OR UPDATE ALIAS
