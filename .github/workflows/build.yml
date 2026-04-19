@@ -40,39 +40,42 @@ jobs:
         ROLE_ARN="arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.LAMBDA_ROLE_NAME }}"
         REGION="us-east-1"
 
+        JAR_PATH=$(ls target/*.jar | head -n 1)
+        echo "Using JAR: $JAR_PATH"
+
         FUNCTION_EXISTS=$(aws lambda get-function \
           --function-name $FUNCTION_NAME \
           --region $REGION 2>&1 || true)
 
-        if echo "$FUNCTION_EXISTS" | grep -q "Function not found"; then
+        if echo "$FUNCTION_EXISTS" | grep -q "ResourceNotFoundException"; then
           echo "Creating new Lambda function: $FUNCTION_NAME"
-
           aws lambda create-function \
             --function-name $FUNCTION_NAME \
             --runtime $RUNTIME \
             --role $ROLE_ARN \
             --handler $HANDLER \
-            --zip-file fileb://target/lambda-app.jar \
+            --zip-file fileb://$JAR_PATH \
             --memory-size 512 \
             --timeout 30 \
             --snap-start ApplyOn=PublishedVersions \
             --environment Variables="{SPRING_PROFILES_ACTIVE=prod}" \
             --description "Spring Boot Lambda with SnapStart" \
             --region $REGION
-
-          echo "Lambda function $FUNCTION_NAME created successfully!"
+          echo "Lambda function created successfully!"
         else
-          echo "Lambda function $FUNCTION_NAME exists. Updating code..."
-
+          echo "Lambda function exists. Updating code..."
           aws lambda update-function-code \
             --function-name $FUNCTION_NAME \
-            --zip-file fileb://target/lambda-app.jar \
+            --zip-file fileb://$JAR_PATH \
             --region $REGION
         fi
 
     - name: Wait for Lambda to be Active
       run: |
         aws lambda wait function-active \
+          --function-name simple-lambda-snapstart \
+          --region us-east-1
+        aws lambda wait function-updated \
           --function-name simple-lambda-snapstart \
           --region us-east-1
         echo "Lambda is active!"
@@ -91,12 +94,13 @@ jobs:
           --snap-start ApplyOn=PublishedVersions \
           --region us-east-1
 
-    - name: Wait for Lambda Configuration Update
+    - name: Wait for Configuration Update
       run: |
         aws lambda wait function-updated \
           --function-name simple-lambda-snapstart \
           --region us-east-1
         sleep 5
+        echo "Configuration updated!"
 
     # ─────────────────────────────────────────
     # STEP 3 - PUBLISH VERSION FOR SNAPSTART
@@ -113,56 +117,51 @@ jobs:
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Published Version: $VERSION"
 
+    # ─────────────────────────────────────────
+    # STEP 4 - WAIT FOR SNAPSTART SNAPSHOT
+    # ─────────────────────────────────────────
     - name: Wait for SnapStart Snapshot
-  run: |
-    VERSION=${{ steps.publish_version.outputs.version }}
-    REGION="us-east-1"
-    FUNCTION_NAME="simple-lambda-snapstart"
-    MAX_ATTEMPTS=20
-    ATTEMPT=0
+      run: |
+        VERSION=${{ steps.publish_version.outputs.version }}
+        REGION="us-east-1"
+        FUNCTION_NAME="simple-lambda-snapstart"
+        MAX_ATTEMPTS=20
 
-    echo "Waiting for SnapStart snapshot for version $VERSION..."
+        echo "Waiting for SnapStart optimization for version $VERSION..."
 
-    while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-      STATUS=$(aws lambda get-function \
-        --function-name $FUNCTION_NAME \
-        --qualifier $VERSION \
-        --region $REGION \
-        --query 'Configuration.SnapStartResponse.OptimizationStatus' \
-        --output text 2>/dev/null || echo "UNKNOWN")
+        for i in $(seq 1 $MAX_ATTEMPTS); do
+          RESPONSE=$(aws lambda get-function \
+            --function-name $FUNCTION_NAME \
+            --qualifier $VERSION \
+            --region $REGION)
+          STATUS=$(echo $RESPONSE | jq -r '.Configuration.SnapStartResponse.OptimizationStatus')
+          STATE=$(echo $RESPONSE | jq -r '.Configuration.State')
 
-      STATE=$(aws lambda get-function \
-        --function-name $FUNCTION_NAME \
-        --qualifier $VERSION \
-        --region $REGION \
-        --query 'Configuration.State' \
-        --output text 2>/dev/null || echo "UNKNOWN")
+          echo "Attempt $i/$MAX_ATTEMPTS - State: $STATE - SnapStart: $STATUS"
 
-      echo "Attempt $((ATTEMPT+1))/$MAX_ATTEMPTS - State: $STATE - SnapStart: $STATUS"
+          if [ "$STATE" == "Active" ] && [ "$STATUS" == "On" ]; then
+            echo "SnapStart snapshot is ready!"
+            exit 0
+          fi
 
-      if [ "$STATE" == "Active" ] && [ "$STATUS" == "On" ]; then
-        echo "SnapStart snapshot is ready!"
-        break
-      fi
+          if [ "$STATE" == "Failed" ]; then
+            echo "Lambda version failed!"
+            exit 1
+          fi
 
-      if [ "$STATE" == "Failed" ]; then
-        echo "Lambda version failed!"
+          sleep 30
+        done
+
+        echo "Timed out waiting for SnapStart optimization!"
         exit 1
-      fi
-
-      ATTEMPT=$((ATTEMPT+1))
-      sleep 30
-    done
-
-    if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-      echo "Timeout waiting for SnapStart. Proceeding anyway..."
-    fi
 
     # ─────────────────────────────────────────
-    # STEP 4 - CREATE OR UPDATE ALIAS
+    # STEP 5 - CREATE OR UPDATE ALIAS
     # ─────────────────────────────────────────
     - name: Create or Update Lambda Alias
       run: |
+        VERSION=${{ steps.publish_version.outputs.version }}
+
         ALIAS_EXISTS=$(aws lambda get-alias \
           --function-name simple-lambda-snapstart \
           --name prod \
@@ -173,7 +172,7 @@ jobs:
           aws lambda create-alias \
             --function-name simple-lambda-snapstart \
             --name prod \
-            --function-version ${{ steps.publish_version.outputs.version }} \
+            --function-version $VERSION \
             --description "Production alias" \
             --region us-east-1
         else
@@ -181,130 +180,92 @@ jobs:
           aws lambda update-alias \
             --function-name simple-lambda-snapstart \
             --name prod \
-            --function-version ${{ steps.publish_version.outputs.version }} \
+            --function-version $VERSION \
             --region us-east-1
         fi
-        echo "Alias pointing to version ${{ steps.publish_version.outputs.version }}"
+        echo "Alias pointing to version $VERSION"
 
     # ─────────────────────────────────────────
-    # STEP 5 - USE EXISTING API GATEWAY
-    # Update integrations to point to new Lambda
+    # STEP 6 - UPDATE API GATEWAY INTEGRATIONS
     # ─────────────────────────────────────────
     - name: Update Existing API Gateway Integrations
       run: |
         API_ID=${{ secrets.API_GATEWAY_ID }}
-        REGION="us-east-1"
         ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
-        FUNCTION_NAME="simple-lambda-snapstart"
-        LAMBDA_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FUNCTION_NAME:prod"
+        REGION="us-east-1"
+        LAMBDA_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:simple-lambda-snapstart:prod"
 
-        echo "Using existing API Gateway: $API_ID"
-
-        # Get all resources
-        RESOURCES=$(aws apigateway get-resources \
-          --rest-api-id $API_ID \
-          --region $REGION \
-          --query 'items[*].[id,path]' \
-          --output text)
-
-        echo "Existing resources:"
-        echo "$RESOURCES"
-
-        # Get /products resource ID
         PRODUCTS_ID=$(aws apigateway get-resources \
           --rest-api-id $API_ID \
           --region $REGION \
           --query "items[?path=='/products'].id" \
           --output text)
 
-        # Get /products/{productId} resource ID
         PRODUCT_ID_RESOURCE=$(aws apigateway get-resources \
           --rest-api-id $API_ID \
           --region $REGION \
           --query "items[?path=='/products/{productId}'].id" \
           --output text)
 
-        echo "/products resource ID      : $PRODUCTS_ID"
-        echo "/products/{productId} ID   : $PRODUCT_ID_RESOURCE"
+        echo "/products ID           : $PRODUCTS_ID"
+        echo "/products/{productId}  : $PRODUCT_ID_RESOURCE"
 
-        # Helper to update integration only (resource+method already exist)
-        update_integration() {
-          local RESOURCE_ID=$1
-          local HTTP_METHOD=$2
-
+        update_int() {
           aws apigateway put-integration \
             --rest-api-id $API_ID \
-            --resource-id $RESOURCE_ID \
-            --http-method $HTTP_METHOD \
+            --resource-id $1 \
+            --http-method $2 \
             --type AWS_PROXY \
             --integration-http-method POST \
             --uri arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations \
             --region $REGION
-
-          echo "Updated integration: $HTTP_METHOD on $RESOURCE_ID → $FUNCTION_NAME"
+          echo "Updated: $2 → $1"
         }
 
-        # Update /products → GET, POST
-        update_integration $PRODUCTS_ID GET
-        update_integration $PRODUCTS_ID POST
-
-        # Update /products/{productId} → GET, PUT, DELETE
-        update_integration $PRODUCT_ID_RESOURCE GET
-        update_integration $PRODUCT_ID_RESOURCE PUT
-        update_integration $PRODUCT_ID_RESOURCE DELETE
+        update_int $PRODUCTS_ID GET
+        update_int $PRODUCTS_ID POST
+        update_int $PRODUCT_ID_RESOURCE GET
+        update_int $PRODUCT_ID_RESOURCE PUT
+        update_int $PRODUCT_ID_RESOURCE DELETE
 
     # ─────────────────────────────────────────
-    # STEP 6 - LAMBDA PERMISSION FOR API GATEWAY
+    # STEP 7 - PERMISSIONS & DEPLOY
     # ─────────────────────────────────────────
-    - name: Add Lambda Permission for API Gateway
+    - name: Finalize API Gateway
       run: |
         API_ID=${{ secrets.API_GATEWAY_ID }}
         REGION="us-east-1"
 
         aws lambda remove-permission \
           --function-name simple-lambda-snapstart \
-          --statement-id apigateway-snapstart-invoke \
+          --statement-id api-invoke \
           --qualifier prod \
           --region $REGION 2>/dev/null || true
 
         aws lambda add-permission \
           --function-name simple-lambda-snapstart \
-          --statement-id apigateway-snapstart-invoke \
+          --statement-id api-invoke \
           --action lambda:InvokeFunction \
           --principal apigateway.amazonaws.com \
-          --source-arn arn:aws:execute-api:$REGION:${{ secrets.AWS_ACCOUNT_ID }}:$API_ID/*/*/* \
+          --source-arn "arn:aws:execute-api:$REGION:${{ secrets.AWS_ACCOUNT_ID }}:$API_ID/*/*/*" \
           --qualifier prod \
           --region $REGION
 
-        echo "Lambda permission granted!"
-
-    # ─────────────────────────────────────────
-    # STEP 7 - DEPLOY TO NEW STAGE snapstart
-    # Existing prod stage is untouched
-    # ─────────────────────────────────────────
-    - name: Deploy to snapstart Stage
-      run: |
         aws apigateway create-deployment \
-          --rest-api-id ${{ secrets.API_GATEWAY_ID }} \
+          --rest-api-id $API_ID \
           --stage-name snapstart \
           --description "SnapStart Deploy - ${{ github.sha }}" \
-          --region us-east-1
-        echo "Deployed to snapstart stage!"
+          --region $REGION
 
-    - name: Print Final URLs
-      run: |
-        API_ID=${{ secrets.API_GATEWAY_ID }}
-        BASE="https://$API_ID.execute-api.us-east-1.amazonaws.com/snapstart"
         echo "========================================="
-        echo "  SNAPSTART DEPLOYMENT COMPLETE!"
+        echo "  DEPLOYMENT COMPLETE!"
         echo "  Function : simple-lambda-snapstart"
-        echo "  Stage    : snapstart (new)"
-        echo "========================================="
-        echo "  GET  ALL : $BASE/products"
-        echo "  POST     : $BASE/products"
-        echo "  GET  ONE : $BASE/products/{productId}"
-        echo "  PUT      : $BASE/products/{productId}"
-        echo "  DELETE   : $BASE/products/{productId}"
-        echo "========================================="
+        echo "  Stage    : snapstart"
+        echo "  BASE URL : https://$API_ID.execute-api.$REGION.amazonaws.com/snapstart"
+        echo "  GET  ALL : https://$API_ID.execute-api.$REGION.amazonaws.com/snapstart/products"
+        echo "  POST     : https://$API_ID.execute-api.$REGION.amazonaws.com/snapstart/products"
+        echo "  GET  ONE : https://$API_ID.execute-api.$REGION.amazonaws.com/snapstart/products/{productId}"
+        echo "  PUT      : https://$API_ID.execute-api.$REGION.amazonaws.com/snapstart/products/{productId}"
+        echo "  DELETE   : https://$API_ID.execute-api.$REGION.amazonaws.com/snapstart/products/{productId}"
         echo "  prod stage is completely untouched!"
         echo "========================================="
