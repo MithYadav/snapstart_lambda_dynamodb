@@ -1,0 +1,273 @@
+name: Java CI/CD - SnapStart Lambda + Existing API Gateway
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Build with Maven
+      run: mvn clean package -DskipTests
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    # ─────────────────────────────────────────
+    # STEP 1 - CREATE OR UPDATE LAMBDA FUNCTION
+    # ─────────────────────────────────────────
+    - name: Create or Update Lambda Function
+      run: |
+        FUNCTION_NAME="simple-lambda-snapstart"
+        HANDLER="com.example.test.StreamLambdaHandler::handleRequest"
+        RUNTIME="java21"
+        ROLE_ARN="arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.LAMBDA_ROLE_NAME }}"
+        REGION="us-east-1"
+
+        FUNCTION_EXISTS=$(aws lambda get-function \
+          --function-name $FUNCTION_NAME \
+          --region $REGION 2>&1 || true)
+
+        if echo "$FUNCTION_EXISTS" | grep -q "Function not found"; then
+          echo "Creating new Lambda function: $FUNCTION_NAME"
+
+          aws lambda create-function \
+            --function-name $FUNCTION_NAME \
+            --runtime $RUNTIME \
+            --role $ROLE_ARN \
+            --handler $HANDLER \
+            --zip-file fileb://target/lambda-app.jar \
+            --memory-size 512 \
+            --timeout 30 \
+            --snap-start ApplyOn=PublishedVersions \
+            --environment Variables="{SPRING_PROFILES_ACTIVE=prod}" \
+            --description "Spring Boot Lambda with SnapStart" \
+            --region $REGION
+
+          echo "Lambda function $FUNCTION_NAME created successfully!"
+        else
+          echo "Lambda function $FUNCTION_NAME exists. Updating code..."
+
+          aws lambda update-function-code \
+            --function-name $FUNCTION_NAME \
+            --zip-file fileb://target/lambda-app.jar \
+            --region $REGION
+        fi
+
+    - name: Wait for Lambda to be Active
+      run: |
+        aws lambda wait function-active \
+          --function-name simple-lambda-snapstart \
+          --region us-east-1
+        echo "Lambda is active!"
+
+    # ─────────────────────────────────────────
+    # STEP 2 - UPDATE LAMBDA CONFIGURATION
+    # ─────────────────────────────────────────
+    - name: Update Lambda Configuration
+      run: |
+        aws lambda update-function-configuration \
+          --function-name simple-lambda-snapstart \
+          --handler com.example.test.StreamLambdaHandler::handleRequest \
+          --runtime java21 \
+          --memory-size 512 \
+          --timeout 30 \
+          --snap-start ApplyOn=PublishedVersions \
+          --region us-east-1
+
+    - name: Wait for Lambda Configuration Update
+      run: |
+        aws lambda wait function-updated \
+          --function-name simple-lambda-snapstart \
+          --region us-east-1
+        sleep 5
+
+    # ─────────────────────────────────────────
+    # STEP 3 - PUBLISH VERSION FOR SNAPSTART
+    # ─────────────────────────────────────────
+    - name: Publish Lambda Version
+      id: publish_version
+      run: |
+        VERSION=$(aws lambda publish-version \
+          --function-name simple-lambda-snapstart \
+          --description "SnapStart - ${{ github.sha }}" \
+          --query 'Version' \
+          --output text \
+          --region us-east-1)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Published Version: $VERSION"
+
+    - name: Wait for SnapStart Snapshot
+      run: |
+        aws lambda wait published-version-active \
+          --function-name simple-lambda-snapstart \
+          --qualifier ${{ steps.publish_version.outputs.version }} \
+          --region us-east-1
+        echo "SnapStart snapshot ready!"
+
+    # ─────────────────────────────────────────
+    # STEP 4 - CREATE OR UPDATE ALIAS
+    # ─────────────────────────────────────────
+    - name: Create or Update Lambda Alias
+      run: |
+        ALIAS_EXISTS=$(aws lambda get-alias \
+          --function-name simple-lambda-snapstart \
+          --name prod \
+          --region us-east-1 2>&1 || true)
+
+        if echo "$ALIAS_EXISTS" | grep -q "ResourceNotFoundException"; then
+          echo "Creating new alias..."
+          aws lambda create-alias \
+            --function-name simple-lambda-snapstart \
+            --name prod \
+            --function-version ${{ steps.publish_version.outputs.version }} \
+            --description "Production alias" \
+            --region us-east-1
+        else
+          echo "Updating existing alias..."
+          aws lambda update-alias \
+            --function-name simple-lambda-snapstart \
+            --name prod \
+            --function-version ${{ steps.publish_version.outputs.version }} \
+            --region us-east-1
+        fi
+        echo "Alias pointing to version ${{ steps.publish_version.outputs.version }}"
+
+    # ─────────────────────────────────────────
+    # STEP 5 - USE EXISTING API GATEWAY
+    # Update integrations to point to new Lambda
+    # ─────────────────────────────────────────
+    - name: Update Existing API Gateway Integrations
+      run: |
+        API_ID=${{ secrets.API_GATEWAY_ID }}
+        REGION="us-east-1"
+        ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+        FUNCTION_NAME="simple-lambda-snapstart"
+        LAMBDA_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FUNCTION_NAME:prod"
+
+        echo "Using existing API Gateway: $API_ID"
+
+        # Get all resources
+        RESOURCES=$(aws apigateway get-resources \
+          --rest-api-id $API_ID \
+          --region $REGION \
+          --query 'items[*].[id,path]' \
+          --output text)
+
+        echo "Existing resources:"
+        echo "$RESOURCES"
+
+        # Get /products resource ID
+        PRODUCTS_ID=$(aws apigateway get-resources \
+          --rest-api-id $API_ID \
+          --region $REGION \
+          --query "items[?path=='/products'].id" \
+          --output text)
+
+        # Get /products/{productId} resource ID
+        PRODUCT_ID_RESOURCE=$(aws apigateway get-resources \
+          --rest-api-id $API_ID \
+          --region $REGION \
+          --query "items[?path=='/products/{productId}'].id" \
+          --output text)
+
+        echo "/products resource ID      : $PRODUCTS_ID"
+        echo "/products/{productId} ID   : $PRODUCT_ID_RESOURCE"
+
+        # Helper to update integration only (resource+method already exist)
+        update_integration() {
+          local RESOURCE_ID=$1
+          local HTTP_METHOD=$2
+
+          aws apigateway put-integration \
+            --rest-api-id $API_ID \
+            --resource-id $RESOURCE_ID \
+            --http-method $HTTP_METHOD \
+            --type AWS_PROXY \
+            --integration-http-method POST \
+            --uri arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations \
+            --region $REGION
+
+          echo "Updated integration: $HTTP_METHOD on $RESOURCE_ID → $FUNCTION_NAME"
+        }
+
+        # Update /products → GET, POST
+        update_integration $PRODUCTS_ID GET
+        update_integration $PRODUCTS_ID POST
+
+        # Update /products/{productId} → GET, PUT, DELETE
+        update_integration $PRODUCT_ID_RESOURCE GET
+        update_integration $PRODUCT_ID_RESOURCE PUT
+        update_integration $PRODUCT_ID_RESOURCE DELETE
+
+    # ─────────────────────────────────────────
+    # STEP 6 - LAMBDA PERMISSION FOR API GATEWAY
+    # ─────────────────────────────────────────
+    - name: Add Lambda Permission for API Gateway
+      run: |
+        API_ID=${{ secrets.API_GATEWAY_ID }}
+        REGION="us-east-1"
+
+        aws lambda remove-permission \
+          --function-name simple-lambda-snapstart \
+          --statement-id apigateway-snapstart-invoke \
+          --qualifier prod \
+          --region $REGION 2>/dev/null || true
+
+        aws lambda add-permission \
+          --function-name simple-lambda-snapstart \
+          --statement-id apigateway-snapstart-invoke \
+          --action lambda:InvokeFunction \
+          --principal apigateway.amazonaws.com \
+          --source-arn arn:aws:execute-api:$REGION:${{ secrets.AWS_ACCOUNT_ID }}:$API_ID/*/*/* \
+          --qualifier prod \
+          --region $REGION
+
+        echo "Lambda permission granted!"
+
+    # ─────────────────────────────────────────
+    # STEP 7 - DEPLOY TO NEW STAGE snapstart
+    # Existing prod stage is untouched
+    # ─────────────────────────────────────────
+    - name: Deploy to snapstart Stage
+      run: |
+        aws apigateway create-deployment \
+          --rest-api-id ${{ secrets.API_GATEWAY_ID }} \
+          --stage-name snapstart \
+          --description "SnapStart Deploy - ${{ github.sha }}" \
+          --region us-east-1
+        echo "Deployed to snapstart stage!"
+
+    - name: Print Final URLs
+      run: |
+        API_ID=${{ secrets.API_GATEWAY_ID }}
+        BASE="https://$API_ID.execute-api.us-east-1.amazonaws.com/snapstart"
+        echo "========================================="
+        echo "  SNAPSTART DEPLOYMENT COMPLETE!"
+        echo "  Function : simple-lambda-snapstart"
+        echo "  Stage    : snapstart (new)"
+        echo "========================================="
+        echo "  GET  ALL : $BASE/products"
+        echo "  POST     : $BASE/products"
+        echo "  GET  ONE : $BASE/products/{productId}"
+        echo "  PUT      : $BASE/products/{productId}"
+        echo "  DELETE   : $BASE/products/{productId}"
+        echo "========================================="
+        echo "  prod stage is completely untouched!"
+        echo "========================================="
