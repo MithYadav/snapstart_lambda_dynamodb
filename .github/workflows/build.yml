@@ -233,38 +233,97 @@ jobs:
         REGION="us-east-1"
         LAMBDA_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:simple-lambda-snapstart:prod"
 
+        echo "API Gateway ID: $API_ID"
+
+        # Get root resource ID
+        ROOT_ID=$(aws apigateway get-resources \
+          --rest-api-id $API_ID \
+          --region $REGION \
+          --query 'items[?path==`/`].id' \
+          --output text)
+        echo "Root ID: $ROOT_ID"
+
+        # Get or Create /products resource
         PRODUCTS_ID=$(aws apigateway get-resources \
           --rest-api-id $API_ID \
           --region $REGION \
           --query "items[?path=='/products'].id" \
           --output text)
 
+        if [ -z "$PRODUCTS_ID" ] || [ "$PRODUCTS_ID" == "None" ]; then
+          echo "Creating /products resource..."
+          PRODUCTS_ID=$(aws apigateway create-resource \
+            --rest-api-id $API_ID \
+            --parent-id $ROOT_ID \
+            --path-part products \
+            --region $REGION \
+            --query 'id' \
+            --output text)
+          echo "Created /products: $PRODUCTS_ID"
+        else
+          echo "/products already exists: $PRODUCTS_ID"
+        fi
+
+        # Get or Create /products/{productId} resource
         PRODUCT_ID_RESOURCE=$(aws apigateway get-resources \
           --rest-api-id $API_ID \
           --region $REGION \
           --query "items[?path=='/products/{productId}'].id" \
           --output text)
 
-        echo "/products ID           : $PRODUCTS_ID"
-        echo "/products/{productId}  : $PRODUCT_ID_RESOURCE"
+        if [ -z "$PRODUCT_ID_RESOURCE" ] || [ "$PRODUCT_ID_RESOURCE" == "None" ]; then
+          echo "Creating /products/{productId} resource..."
+          PRODUCT_ID_RESOURCE=$(aws apigateway create-resource \
+            --rest-api-id $API_ID \
+            --parent-id $PRODUCTS_ID \
+            --path-part "{productId}" \
+            --region $REGION \
+            --query 'id' \
+            --output text)
+          echo "Created /products/{productId}: $PRODUCT_ID_RESOURCE"
+        else
+          echo "/products/{productId} already exists: $PRODUCT_ID_RESOURCE"
+        fi
 
-        update_int() {
+        echo "/products ID          : $PRODUCTS_ID"
+        echo "/products/{productId} : $PRODUCT_ID_RESOURCE"
+
+        # Helper to create method if not exists + update integration
+        setup_method() {
+          local RESOURCE_ID=$1
+          local HTTP_METHOD=$2
+
+          # Create method if not exists
+          aws apigateway put-method \
+            --rest-api-id $API_ID \
+            --resource-id $RESOURCE_ID \
+            --http-method $HTTP_METHOD \
+            --authorization-type NONE \
+            --region $REGION 2>/dev/null || true
+
+          # Update integration
           aws apigateway put-integration \
             --rest-api-id $API_ID \
-            --resource-id $1 \
-            --http-method $2 \
+            --resource-id $RESOURCE_ID \
+            --http-method $HTTP_METHOD \
             --type AWS_PROXY \
             --integration-http-method POST \
             --uri arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations \
             --region $REGION
-          echo "Updated: $2 → $1"
+
+          echo "Setup $HTTP_METHOD on $RESOURCE_ID ✓"
         }
 
-        update_int $PRODUCTS_ID GET
-        update_int $PRODUCTS_ID POST
-        update_int $PRODUCT_ID_RESOURCE GET
-        update_int $PRODUCT_ID_RESOURCE PUT
-        update_int $PRODUCT_ID_RESOURCE DELETE
+        # /products → GET, POST
+        setup_method $PRODUCTS_ID GET
+        setup_method $PRODUCTS_ID POST
+
+        # /products/{productId} → GET, PUT, DELETE
+        setup_method $PRODUCT_ID_RESOURCE GET
+        setup_method $PRODUCT_ID_RESOURCE PUT
+        setup_method $PRODUCT_ID_RESOURCE DELETE
+
+        echo "All methods and integrations configured!"
 
     # ─────────────────────────────────────────
     # STEP 7 - PERMISSIONS & DEPLOY
