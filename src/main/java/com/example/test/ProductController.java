@@ -59,17 +59,20 @@ public class ProductController {
 		return ResponseEntity.ok().body(product);
 	}
 
-	@PutMapping
+	@PutMapping("/{productId}")
 	public ResponseEntity<Product> updateProduct(@PathVariable("productId") String productId,
 			@RequestBody Product product) {
 
-		Product updateProduct = productService.getProduct(productId);
+		// 1. Basic validation to prevent null hangs
+		if (productId == null || product == null) {
+			return ResponseEntity.badRequest().build();
+		}
 
-		updateProduct.setName(product.getName());
-		updateProduct.setDescription(product.getDescription());
-		updateProduct.setPrice(product.getPrice());
-		productService.updateProduct(productId,updateProduct);
-		return ResponseEntity.status(HttpStatus.OK).body(updateProduct);
+		product.setProductId(productId);
+
+		Product updated = productService.updateProduct(productId, product);
+
+		return ResponseEntity.ok(updated);
 	}
 
 	@DeleteMapping("/{productId}")
